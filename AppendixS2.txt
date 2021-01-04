@@ -1,0 +1,1344 @@
+################################################################################
+# APPENDIX S2-1
+# BiSSE 
+# Authors: E. Karen López-Estrada & Isabel Sanmartín
+################################################################################
+
+#######################
+# Reading in the Data #
+#######################
+
+
+NUM_STATES = 2
+DATASET = "HOST"
+### Read in the data
+T = readTrees("BiSSE_MuSSE/ConLyttini.tre") [1] # Read trees
+
+data <- readCharacterData("BiSSE_MuSSE/Traits_conLyttini_01.nex")
+
+
+# set my move index
+mvi = 0
+mni = 0
+
+
+H = 0.587405
+
+
+
+
+####################
+# Create the rates #
+####################
+
+### Specify a prior on the diversification and turnover rate
+
+### Create the constant prior parameters of the diversification rates
+rate_mean <- ln( ln(3000.0/2.0) / T.rootAge() )
+rate_sd <- H
+
+for (i in 1:NUM_STATES) {
+    
+     ### Create a lognormal distributed variable for the diversification rate
+    log_speciation[i] ~ dnNormal(mean=rate_mean,sd=rate_sd) 
+    speciation[i] := exp( log_speciation[i] )
+    moves[++mvi] = mvSlide(log_speciation[i],delta=0.20,tune=true,weight=3.0)
+
+    log_extinction[i] ~ dnNormal(mean=rate_mean,sd=rate_sd) 
+    extinction[i] := exp( log_extinction[i] )
+    moves[++mvi] = mvSlide(log_extinction[i],delta=0.20,tune=true,weight=3.0)
+    
+}
+
+
+#########################################################
+# Set up the transition rate matrix for observed states #
+#########################################################
+
+# Each transition rate between observed states are drawn
+# from an exponential distribution with a mean of 10
+# character state transitions over the tree. 
+rate_pr := T.treeLength() / 10
+rate_12 ~ dnExp(rate_pr)
+rate_21 ~ dnExp(rate_pr)
+
+moves[++mvi] = mvScale( rate_12, weight=2 )
+moves[++mvi] = mvScale( rate_21, weight=2 )
+
+
+
+######################################################################
+# Create the rate matrix for the combined observed and hidden states #
+######################################################################
+rate_matrix := fnFreeBinary( [rate_12, rate_21 ], rescaled=false)
+
+
+#####################################
+# Set up the root state frequencies #
+#####################################
+
+### Create a constant variable with the prior probabilities of each rate category at the root.
+rate_category_prior ~ dnDirichlet( rep(1,NUM_STATES) )
+moves[++mvi] = mvDirichletSimplex(rate_category_prior,tune=true,weight=2)
+
+
+### Create the fix parameter for the age of the root set to the observed age
+root <- T.rootAge()
+
+
+### rho is the probability of sampling species at the present
+### fix this to 233/367
+rho <- T.ntips()/3000
+
+
+#### construct a variable for the tree drawn from a birth death process
+timetree ~ dnCDBDP( rootAge           = root,
+                    speciationRates   = speciation,
+                    extinctionRates   = extinction, 
+                    Q                 = rate_matrix,
+                    pi                = rate_category_prior,
+                    delta             = 1.0,
+                    rho               = rho,
+                    condition         = "time")
+
+### clamp the model with the "observed" tree
+timetree.clamp( T )
+timetree.clampCharData( data )
+
+
+
+#############
+# The Model #
+#############
+
+
+### workspace model wrapper ###
+mymodel = model(rate_matrix)
+
+### set up the monitors that will output parameter values to file and screen 
+monitors[++mni] = mnModel(filename="BiSSE_MuSSE/output/mitos_BiSSE_clyttini.log", printgen=1)
+monitors[++mni] = mnJointConditionalAncestralState(tree=timetree, cdbdp=timetree, type="Standard", printgen=1, withTips=true, withStartStates=false, filename="BiSSE_MuSSE/output/anc_states_MITOS_BiSSE_clyttini.log")
+monitors[++mni] = mnScreen(printgen=10, rate_12, rate_21, speciation, extinction)
+monitors[++mni] = mnStochasticCharacterMap(cdbdp=timetree, printgen=10, filename="BiSSE_MuSSE/output/SCHM_BiSSE_clyttini.log")
+
+
+
+################
+# The Analysis #
+################
+
+### workspace mcmc
+mymcmc = mcmc(mymodel, monitors, moves, nruns=1, moveschedule="random")
+
+### pre-burnin to tune the proposals
+#mymcmc.burnin(generations=10000,tuningInterval=100)
+
+### run the MCMC
+mymcmc.run(generations=40000)
+
+##############################
+# Summarize ancestral states #
+##############################
+
+
+anc_states = readAncestralStateTrace("BiSSE_MuSSE/output/anc_states_MITOS_BiSSE_clyttini.log")
+anc_tree = ancestralStateTree(tree=T, ancestral_state_trace_vector=anc_states, include_start_states=false, file="BiSSE_MuSSE/output/anc_states_MITOS_BiSSE_clyttini.tree", burnin=0.2, summary_statistic="MAP", site=1)
+
+
+
+#####################################################
+# Summarize ancestral states for Stochastic Mapping #
+#####################################################
+
+anc_states_SCHM = readAncestralStateTrace("BiSSE_MuSSE/output/SCHM_BiSSE_clyttini.log")
+
+
+burnin=0.2
+n_time_slices = 500
+
+
+char_map_tree = characterMapTree(tree=T, 
+                 ancestral_state_trace_vector=anc_states_SCHM, 
+                 character_file="BiSSE_MuSSE/output/MITOS_BiSSEcLyttini_marginal_character.tree", 
+                 posterior_file="BiSSE_MuSSE/output/MITOS_BiSSEcLyttini_marginal_posterior.tree", 
+                 burnin=burnin, 
+                 num_time_slices=n_time_slices)
+
+
+
+q()
+
+
+
+
+################################################################################
+# APPENDIX S2-2
+# HiSSE
+# Authors: Sebastian Hoehna & Will Freyman
+################################################################################
+
+#######################
+# Reading in the Data #
+#######################
+
+
+
+# Global parameters for our analysis
+NUM_TOTAL_SPECIES     = 3000.0
+NUM_STATES            = 2
+NUM_HIDDEN            = 2
+NUM_RATES             = NUM_STATES * NUM_HIDDEN
+H                     = 0.587405
+
+# Read in the observed phylogeny
+observed_phylogeny <- readTrees("HiSSE_TUT/ConLyttini.tre")[1]
+data <- readCharacterData("HiSSE_TUT/Traits_conLyttini_01.nex")
+
+# we need to expand the data to the hidden states
+data_exp <- data.expandCharacters( NUM_HIDDEN )
+
+# Get the names of the taxa in the tree and the age of the tree. We need these later on.
+taxa <- observed_phylogeny.taxa()
+tree_length <- observed_phylogeny.treeLength()
+
+
+# Create some vector for the moves and monitors of this analysis
+moves    = VectorMoves()
+monitors = VectorMonitors()
+
+
+####################
+# Create the rates #
+####################
+
+### Specify a prior on the speciation and extinction rates
+rate_mean <- (NUM_TOTAL_SPECIES-2) / tree_length
+
+
+
+### First, we create the hidden speciation rates
+# We fix the (log) mean of the hidden speciation rate to 1.0, so that these rates are relative
+ln_speciation_hidden_mean <- ln(1.0)
+
+# We draw the standard deviation of the hidden rates from an exponential distribution with mean H 
+# (so that we expect the 95% interval of the hidden speciation rate to span 1 order of magnitude).
+speciation_hidden_sd ~ dnExponential( 1.0 / H )
+moves.append( mvScale(speciation_hidden_sd, lambda=1, tune=true, weight=2.0) )
+
+# Create a deterministic variable for the hidden speciation rate categories
+# using a discretized lognormal distribution (the N-quantiles of it)
+speciation_hidden_unormalized := fnDiscretizeDistribution( dnLognormal(ln_speciation_hidden_mean, speciation_hidden_sd), NUM_HIDDEN )
+
+# We normalize the hidden speciation rates by dividing the rates with the main 
+# (so the mean of the normalized rates equals to 1.0)
+speciation_hidden := speciation_hidden_unormalized / mean(speciation_hidden_unormalized)
+
+
+
+### Second, we create the hidden extinction rates
+# We fix the (log) mean of the hidden extinction rate to 1.0, so that these rates are relative
+ln_extinction_hidden_mean <- ln(1.0)
+
+# We draw the standard deviation of the hidden extinction rates from an exponential distribution with mean H 
+# (so that we expect the 95% interval of the hidden extinction rate to span 1 order of magnitude).
+extinction_hidden_sd ~ dnExponential( 1.0 / H )
+moves.append( mvScale(extinction_hidden_sd, lambda=1, tune=true, weight=2.0) )
+
+# Create a deterministic variable for the hidden extinction rate categories
+# using a discretized lognormal distribution (the N-quantiles of it)
+extinction_hidden_unormalized := fnDiscretizeDistribution( dnLognormal(ln_extinction_hidden_mean, extinction_hidden_sd), NUM_HIDDEN )
+
+# We normalize the hidden extinction rates by dividing the rates with the main 
+# (so the mean of the normalized rates equals to 1.0)
+extinction_hidden := extinction_hidden_unormalized / mean(extinction_hidden_unormalized)
+
+
+
+### Third, we create the speciation and extinction rates for the observed states
+for (i in 1:NUM_STATES) {
+    
+    ### Create a loguniform distributed variable for the speciation rate
+    speciation_observed[i] ~ dnLoguniform( 1E-6, 1E2)
+    speciation_observed[i].setValue( (NUM_TOTAL_SPECIES-2) / tree_length )
+    moves.append( mvScale(speciation_observed[i],lambda=1.0,tune=true,weight=3.0) )
+
+    ### Create a loguniform distributed variable for the speciation rate
+    extinction_observed[i] ~ dnLoguniform( 1E-6, 1E2)
+    extinction_observed[i].setValue( speciation_observed[i] / 10.0 )
+    moves.append( mvScale(extinction_observed[i],lambda=1.0,tune=true,weight=3.0) )
+
+}
+
+
+
+### Finally, we put the observed and hidden rates together
+for (j in 1:NUM_HIDDEN) {
+    for (i in 1:NUM_STATES) {
+        index = i+(j*NUM_STATES)-NUM_STATES
+        speciation[index] := speciation_observed[i] * speciation_hidden[j]
+        extinction[index] := extinction_observed[i] * extinction_hidden[j]
+    }
+}
+
+
+#########################################################
+# Set up the transition rate matrix for observed states #
+#########################################################
+
+# Each transition rate between observed states are drawn
+# from an exponential distribution with a mean of 10
+# character state transitions over the tree. 
+rate_pr := observed_phylogeny.treeLength() / 10
+for ( i in 1:(NUM_STATES*(NUM_STATES-1)) ) {
+    transition_rates[i] ~ dnExp(rate_pr)
+    moves.append( mvScale(transition_rates[i],lambda=0.50,tune=true,weight=3.0) )
+}
+
+
+#########################################################
+# Set up the transition rate matrix for hidden states #
+#########################################################
+
+# We assume the transitions among the hidden states
+# are all equal and drawn from an exponential distriubtion.
+hidden_rate ~ dnExponential(rate_pr)
+moves.append( mvScale(hidden_rate,lambda=0.5,tune=true,weight=5) )
+
+for (i in 1:(NUM_HIDDEN * (NUM_HIDDEN - 1))) {
+    R[i] := hidden_rate
+}
+
+######################################################################
+# Create the rate matrix for the combined observed and hidden states #
+######################################################################
+rate_matrix := fnHiddenStateRateMatrix(transition_rates, R, rescaled=false)
+
+
+
+#####################################
+# Set up the root state frequencies #
+#####################################
+
+### Create a constant variable with the prior probabilities of each rate category at the root.
+rate_category_prior ~ dnDirichlet( rep(1,NUM_RATES) )
+moves.append( mvBetaSimplex(rate_category_prior,tune=true,weight=2) )
+moves.append( mvDirichletSimplex(rate_category_prior,tune=true,weight=2) )
+
+
+### Create the fix parameter for the age of the root set to the observed age
+root <- observed_phylogeny.rootAge()
+
+
+### rho is the probability of sampling species at the present
+### fix this to 233/367
+rho <- observed_phylogeny.ntips()/3000.0
+
+
+#### construct a variable for the tree drawn from a birth death process
+timetree ~ dnCDBDP( rootAge           = root,
+                    speciationRates   = speciation,
+                    extinctionRates   = extinction, 
+                    Q                 = rate_matrix,
+                    delta             = 1.0,
+                    pi                = rate_category_prior,
+                    rho               = rho,
+                    condition         = "survival" )
+
+### clamp the model with the "observed" tree
+timetree.clamp( observed_phylogeny )
+timetree.clampCharData( data_exp )
+
+
+
+
+#############
+# The Model #
+#############
+
+
+### workspace model wrapper ###
+mymodel = model(rate_matrix)
+
+### set up the monitors that will output parameter values to file and screen 
+monitors.append( mnModel(filename="HiSSE_TUT/output2/mitos_HiSSE_clyttini_TUTscript.log", printgen=1) )
+monitors.append( mnJointConditionalAncestralState(tree=timetree, cdbdp=timetree, type="NaturalNumbers", printgen=1, withTips=true, withStartStates=false, filename="HiSSE_TUT/output2/anc_states_mitos_HiSSE_clyttini_TUTscript.log") )
+monitors.append( mnStochasticCharacterMap(cdbdp=timetree, printgen=10, filename="HiSSE_TUT/output2/stoch_char_map_mitos_HiSSE_clyttini_TUTscript.log", include_simmap=true) )
+monitors.append( mnScreen(printgen=100, speciation_observed, extinction_observed) )
+
+
+################
+# The Analysis #
+################
+
+### workspace mcmc
+mymcmc = mcmc(mymodel, monitors, moves, nruns=1, moveschedule="random", combine="mixed")
+
+### run the MCMC
+mymcmc.run(generations=40000, tuningInterval=100)
+mymcmc.run(generations=40000, checkpointInterval=100, checkpointFile="HiSSE_TUT/output2/check.state")
+##################################################################
+## Summarize ancestral states for JointConditionalAncestralState #
+##################################################################
+
+anc_states2 = readAncestralStateTrace("HiSSE_TUT/output2/anc_states_mitos_HiSSE_clyttini_TUTscript.log")
+anc_tree = ancestralStateTree(tree=observed_phylogeny, ancestral_state_trace_vector=anc_states2, include_start_states=false, file="HiSSE_TUT/output2/anc_states_mitos_HiSSE_clyttini_TUTscript.tree", burnin=2, summary_statistic="MAP", site=1)
+
+
+###############################
+## Summarize ancestral states #
+###############################
+
+
+burnin=25
+n_time_slices = 500
+
+# read in the sampled character histories
+anc_states_SCHM = readAncestralStateTrace("HiSSE_TUT/output2/stoch_char_map_mitos_HiSSE_clyttini_TUTscript.log")
+
+#summarizeCharacterMaps(anc_states, observed_phylogeny, file="output/events.tsv", burnin=0.1)
+
+
+# make summary tree
+char_map_tree = characterMapTree(tree=observed_phylogeny, 
+                 ancestral_state_trace_vector=anc_states_SCHM, 
+                 character_file="HiSSE_TUT/output2/stoch_mitos_HiSSE_clyttini_TUTscriptmarginal_char.tree", 
+                 posterior_file="HiSSE_TUT/output2/stoch_mitos_HiSSE_clyttini_TUTscriptmarginal_post.tree", 
+                 burnin=burnin, 
+                 num_time_slices=n_time_slices)
+
+q()
+
+
+################################################################################
+# APPENDIX S2-3
+# MuSSE
+# Authors: E. Karen López-Estrada & Isabel Sanmartín
+################################################################################
+
+#######################
+# Reading in the Data #
+#######################
+
+
+DATASET = "HOST"
+NUM_STATES = 3
+NUM_RATES = NUM_STATES
+
+###### This just defines a single model for all sites #######
+
+### Read in sequence data for both genes
+
+T = readTrees("ConLyttini.tre")[1] # Read trees
+#tree_trace = treeTrace(tree_vector) # Make a trace, I don't completely understand what this object is. 
+#T = mapTree(tree_trace) # make a MAP tree
+
+
+data <- readCharacterData("Traits_conLyttini.nex")
+
+
+# Get some useful variables from the data. We need these later on.
+taxa <- T.taxa()
+
+# set my move index
+mvi = 0
+mni = 0
+
+H = 0.587405
+
+####################
+# Create the rates #
+####################
+
+### Specify a prior on the diversification and turnover rate
+
+### Create the constant prior parameters of the diversification rates
+rate_mean <- ln( ln(3000.0/2.0) / T.rootAge() )
+rate_sd <- H
+
+
+for (i in 1:NUM_STATES) {
+    
+     ### Create a lognormal distributed variable for the diversification rate
+    log_speciation[i] ~ dnNormal(mean=rate_mean,sd=rate_sd) 
+    speciation[i] := exp( log_speciation[i] )
+    moves[++mvi] = mvSlide(log_speciation[i],delta=0.20,tune=true,weight=3.0)
+
+    ### Create a lognormal distributed variable for the turnover rate
+    log_extinction[i] ~ dnNormal(mean=rate_mean,sd=rate_sd) 
+    extinction[i] := exp( log_extinction[i] )
+    moves[++mvi] = mvSlide(log_extinction[i],delta=0.20,tune=true,weight=3.0)
+
+}
+
+#########################
+# Set up the rate model #
+#########################
+
+# we assume every rate i <-> j to be independent and exponentially distributed
+
+rate_pr := T.treeLength() / 10
+
+#### We anulate the forbidden rates (two simultaneous changes) by setting them to zero ###
+
+rate_12 ~ dnExp(rate_pr)
+rate_13 ~ dnExp(rate_pr)
+rate_21 ~ dnExp(rate_pr)
+rate_23 ~ dnExp(rate_pr)
+rate_31 ~ dnExp(rate_pr)
+rate_32 ~ dnExp(rate_pr)
+
+# We only include a move for those rates who has a different value from zero
+moves[++mvi] = mvScale(rate_12,lambda=0.2,tune=true,weight=2)
+moves[++mvi] = mvScale(rate_13,lambda=0.2,tune=true,weight=2)
+moves[++mvi] = mvScale(rate_21,lambda=0.2,tune=true,weight=2)
+moves[++mvi] = mvScale(rate_23,lambda=0.2,tune=true,weight=2)
+moves[++mvi] = mvScale(rate_31,lambda=0.2,tune=true,weight=2)
+moves[++mvi] = mvScale(rate_32,lambda=0.2,tune=true,weight=2)
+
+
+## Q matrix includes all the rates (6)
+
+Q := fnFreeK( [rate_12, rate_13, rate_21, rate_23, rate_31, rate_32], rescale=false )
+
+#####################################
+# Set up the root state frequencies #
+#####################################
+
+### Create a constant variable with the prior probabilities of each rate category at the root.
+
+rate_category_prior ~ dnDirichlet( rep(1,NUM_RATES) )
+moves[++mvi] = mvBetaSimplex(rate_category_prior,tune=true,weight=2)
+moves[++mvi] = mvDirichletSimplex(rate_category_prior,tune=true,weight=2)
+
+### Create the fix parameter for the age of the root set to the observed age
+root <- T.rootAge()
+
+
+### rho is the probability of sampling species at the present
+### fix this to 233/367
+rho <- T.ntips()/3000
+
+
+#### construct a variable for the tree drawn from a birth death process
+timetree ~ dnCDBDP( rootAge           = root,
+                    speciationRates   = speciation,
+                    extinctionRates   = extinction, 
+                    Q                 = Q,
+                    delta             = 1.0,
+                    pi                = rate_category_prior,
+                    rho               = rho,
+                    condition         = "survival" )
+
+### clamp the model with the "observed" tree
+timetree.clamp( T )
+
+timetree.clampCharData( data )
+
+#############
+# The Model #
+#############
+
+
+### workspace model wrapper ###
+
+mymodel = model(Q)
+
+### set up the monitors that will output parameter values to file and screen 
+monitors[++mni] = mnModel(filename="output/Traits1_data_012.log", printgen=1)
+monitors[++mni] = mnJointConditionalAncestralState(tree=timetree, cdbdp=timetree, type="Standard", printgen=1, withTips=true, withStartStates=false, filename="output/anc_states_Traits1_data_012.log")
+monitors[++mni] = mnScreen(printgen=100, Q)
+monitors[++mni] = mnScreen(printgen=10, rate_12, rate_21, speciation, extinction)
+
+## let´s try with stochastic character mapping 
+
+monitors[++mni] = mnStochasticCharacterMap(cdbdp=timetree, printgen=10, filename="output/SCHM1_data_012.log")
+
+
+################
+# The Analysis #
+################
+
+### workspace mcmc
+mymcmc = mcmc(mymodel, monitors, moves, nruns=1, moveschedule="random")
+
+### pre-burnin to tune the proposals
+mymcmc.burnin(generations=5000,tuningInterval=100)
+
+### run the MCMC
+mymcmc.run(generations=20000)
+
+##############################
+# Summarize ancestral states #
+##############################
+
+
+anc_states = readAncestralStateTrace("output/anc_states_Traits1_data_012.log")
+anc_tree = ancestralStateTree(tree=T, ancestral_state_trace_vector=anc_states, include_start_states=false, file="output/anc_states_Model1_012data_results.tree", burnin=0.2, summary_statistic="MAP", site=1)
+
+q()
+
+
+#####################################################
+# Summarize ancestral states for Stochastic Mapping #
+#####################################################
+
+anc_states_SCHM = readAncestralStateTrace("output/SCHM1_data_012.log")
+
+
+burnin=0.2
+n_time_slices = 500
+
+
+char_map_tree = characterMapTree(tree=T, 
+                 ancestral_state_trace_vector=anc_states_SCHM, 
+                 character_file="output/MITOS_Model1_01data_marginal_character.tree", 
+                 posterior_file="output/MITOS_Model1_01data_marginal_posterior.tree", 
+                 burnin=burnin, 
+                 num_time_slices=n_time_slices)
+
+
+
+
+q()
+
+
+################################################################################
+#  APPENDIX S2-4
+# MuHiSSE
+# Authors: E. Karen López-Estrada & Isabel Sanmartín
+################################################################################
+
+#######################
+# Reading in the Data #
+#######################
+
+
+
+# Global parameters for our analysis
+NUM_TOTAL_SPECIES     = 3000
+NUM_STATES            = 3
+NUM_HIDDEN            = 2
+NUM_RATES             = NUM_STATES * NUM_HIDDEN
+H                     = 0.587405
+
+# Read in the observed phylogeny
+T = readTrees("ConLyttini.tre")[1] # Read trees
+data <- readCharacterData("Traits_conLyttini012.nex") #Read data
+
+# we need to expand the data to the hidden states
+data_exp <- data.expandCharacters( NUM_HIDDEN )
+
+# Get the names of the taxa in the tree and the age of the tree. We need these later on.
+taxa <- T.taxa()
+tree_length <- T.treeLength()
+
+
+# Create some vector for the moves and monitors of this analysis
+moves    = VectorMoves()
+monitors = VectorMonitors()
+
+
+####################
+# Create the rates #
+####################
+
+### Specify a prior on the speciation and extinction rates
+rate_mean <- (NUM_TOTAL_SPECIES-2) / tree_length
+
+
+
+### First, we create the hidden speciation rates
+# We fix the (log) mean of the hidden speciation rate to 1.0, so that these rates are relative
+ln_speciation_hidden_mean <- ln(1.0)
+
+# We draw the standard deviation of the hidden rates from an exponential distribution with mean H 
+# (so that we expect the 95% interval of the hidden speciation rate to span 1 order of magnitude).
+speciation_hidden_sd ~ dnExponential( 1.0 / H )
+moves.append( mvScale(speciation_hidden_sd, lambda=1, tune=true, weight=2.0) )
+
+# Create a deterministic variable for the hidden speciation rate categories
+# using a discretized lognormal distribution (the N-quantiles of it)
+speciation_hidden_unormalized := fnDiscretizeDistribution( dnLognormal(ln_speciation_hidden_mean, speciation_hidden_sd), NUM_HIDDEN )
+
+# We normalize the hidden speciation rates by dividing the rates with the main 
+# (so the mean of the normalized rates equals to 1.0)
+speciation_hidden := speciation_hidden_unormalized / mean(speciation_hidden_unormalized)
+
+
+
+### Second, we create the hidden extinction rates
+# We fix the (log) mean of the hidden extinction rate to 1.0, so that these rates are relative
+ln_extinction_hidden_mean <- ln(1.0)
+
+# We draw the standard deviation of the hidden extinction rates from an exponential distribution with mean H 
+# (so that we expect the 95% interval of the hidden extinction rate to span 1 order of magnitude).
+extinction_hidden_sd ~ dnExponential( 1.0 / H )
+moves.append( mvScale(extinction_hidden_sd, lambda=1, tune=true, weight=2.0) )
+
+# Create a deterministic variable for the hidden extinction rate categories
+# using a discretized lognormal distribution (the N-quantiles of it)
+extinction_hidden_unormalized := fnDiscretizeDistribution( dnLognormal(ln_extinction_hidden_mean, extinction_hidden_sd), NUM_HIDDEN )
+
+# We normalize the hidden extinction rates by dividing the rates with the main 
+# (so the mean of the normalized rates equals to 1.0)
+extinction_hidden := extinction_hidden_unormalized / mean(extinction_hidden_unormalized)
+
+
+
+### Third, we create the speciation and extinction rates for the observed states
+for (i in 1:NUM_STATES) {
+    
+    ### Create a loguniform distributed variable for the speciation rate
+    speciation_observed[i] ~ dnLoguniform( 1E-6, 1E2)
+    speciation_observed[i].setValue( (NUM_TOTAL_SPECIES-2) / tree_length )
+    moves.append( mvScale(speciation_observed[i],lambda=1.0,tune=true,weight=3.0) )
+
+    ### Create a loguniform distributed variable for the speciation rate
+    extinction_observed[i] ~ dnLoguniform( 1E-6, 1E2)
+    extinction_observed[i].setValue( speciation_observed[i] / 10.0 )
+    moves.append( mvScale(extinction_observed[i],lambda=1.0,tune=true,weight=3.0) )
+
+}
+
+
+
+### Finally, we put the observed and hidden rates together
+for (j in 1:NUM_HIDDEN) {
+    for (i in 1:NUM_STATES) {
+        index = i+(j*NUM_STATES)-NUM_STATES
+        speciation[index] := speciation_observed[i] * speciation_hidden[j]
+        extinction[index] := extinction_observed[i] * extinction_hidden[j]
+    }
+}
+
+
+#########################################################
+# Set up the transition rate matrix for observed states #
+#########################################################
+
+# Each transition rate between observed states are drawn
+# from an exponential distribution with a mean of 10
+# character state transitions over the tree. 
+rate_pr := T.treeLength() / 10
+for ( i in 1:(NUM_STATES*(NUM_STATES-1)) ) {
+    transition_rates[i] ~ dnExp(rate_pr)
+    moves.append( mvScale(transition_rates[i],lambda=0.50,tune=true,weight=3.0) )
+}
+
+
+#########################################################
+# Set up the transition rate matrix for hidden states #
+#########################################################
+
+# We assume the transitions among the hidden states
+# are all equal and drawn from an exponential distriubtion.
+hidden_rate ~ dnExponential(rate_pr)
+moves.append( mvScale(hidden_rate,lambda=0.5,tune=true,weight=5) )
+
+for (i in 1:(NUM_HIDDEN * (NUM_HIDDEN - 1))) {
+    R[i] := hidden_rate
+}
+
+######################################################################
+# Create the rate matrix for the combined observed and hidden states #
+######################################################################
+rate_matrix := fnHiddenStateRateMatrix(transition_rates, R, rescaled=false)
+
+
+
+#####################################
+# Set up the root state frequencies #
+#####################################
+
+### Create a constant variable with the prior probabilities of each rate category at the root.
+rate_category_prior ~ dnDirichlet( rep(1,NUM_RATES) )
+moves.append( mvBetaSimplex(rate_category_prior,tune=true,weight=2) )
+moves.append( mvDirichletSimplex(rate_category_prior,tune=true,weight=2) )
+
+
+### Create the fix parameter for the age of the root set to the observed age
+root <- T.rootAge()
+
+
+### rho is the probability of sampling species at the present
+###
+rho <- T.ntips()/3000
+
+
+#### construct a variable for the tree drawn from a birth death process
+timetree ~ dnCDBDP( rootAge           = root,
+                    speciationRates   = speciation,
+                    extinctionRates   = extinction, 
+                    Q                 = rate_matrix,
+                    delta             = 1.0,
+                    pi                = rate_category_prior,
+                    rho               = rho,
+                    condition         = "survival" )
+
+### clamp the model with the "observed" tree
+timetree.clamp( T )
+timetree.clampCharData( data_exp )
+
+
+
+
+#############
+# The Model #
+#############
+
+
+### workspace model wrapper ###
+mymodel = model(rate_matrix)
+
+### set up the monitors that will output parameter values to file and screen 
+monitors.append( mnModel(filename="output/MuHiSSE_3.log", printgen=1) )
+monitors.append( mnJointConditionalAncestralState(tree=timetree, cdbdp=timetree, type="NaturalNumbers", printgen=1, withTips=true, withStartStates=false, filename="output/anc_states_mitosMuHiSSE_3.log") )
+monitors.append( mnStochasticCharacterMap(cdbdp=timetree, printgen=10, filename="output/stoch_char_map_mitosMuHiSSE_3.log", include_simmap=true) )
+monitors.append( mnScreen(printgen=10, speciation_observed, extinction_observed) )
+
+
+################
+# The Analysis #
+################
+
+### workspace mcmc
+mymcmc = mcmc(mymodel, monitors, moves, nruns=2, moveschedule="random", combine="mixed")
+
+mymcmc.burnin(generations=10000,tuningInterval=100)
+
+### run the MCMC
+mymcmc.run(generations=40000)
+
+
+#################################################################
+# Summarize ancestral states for JointConditionalAncestralState #
+#################################################################
+
+anc_states = readAncestralStateTrace("anc_states_mitosMuHiSSE_3_run_2.log")
+anc_tree = ancestralStateTree(tree=T, ancestral_state_trace_vector=anc_states, include_start_states=false, file="anc_states_mitosMuHiSSE_3_run2.tree", burnin=0, summary_statistic="MAP", site=1)
+
+#####################################################
+# Summarize ancestral states for Stochastic Mapping #
+#####################################################
+
+
+burnin=0.0
+n_time_slices = 500
+
+# read in the sampled character histories
+anc_states_SCHM = readAncestralStateTrace("stoch_char_map_mitosMuHiSSE_3_run_2.log")
+
+#summarizeCharacterMaps(anc_states, T, file="output/events.tsv", burnin=0.1)
+
+
+ #make summary tree
+char_map_tree = characterMapTree(tree=T, 
+                 ancestral_state_trace_vector=anc_states_SCHM, 
+                 character_file="MuHiSSE/marginal_characterMuHiSSE_run_2.tree", 
+                 posterior_file="MuHiSSE/marginal_posteriorMuHiSSE_run_2.tree", 
+                 burnin=burnin, 
+                 num_time_slices=n_time_slices)
+
+q()
+
+################################################################################
+# APPENDIX S2-5
+# CID2
+# Authors: E. Karen López-Estrada & Isabel Sanmartín
+################################################################################
+
+
+#######################
+# Reading in the Data #
+#######################
+
+DATASET = "MITOS"
+NUM_STATES = 3
+NUM_HIDDEN = 2
+NUM_TOTAL_SPECIES     = 3000.0 # Total number of species in Meloinae-Nemonagthinae
+NUM_SAMPLED_SPECIES   = 2150.0 # Number species sampled in the phylogeny
+H                     = 0.587405
+
+# The states are represented as the following character states:
+# 0  Phoretic bee (tips as "0")
+# 1  Non-phoretic bee (tips as "1")
+# 2  Grashoppers  (tips as "2")
+# Read the MAP tree
+observed_phylogeny <- readTrees("ConLyttini.tre")[1]
+
+
+# # Read the character set data. Two focal observed states 0 and 1 
+data <- readCharacterData("Traits_conLyttini012.nex")
+#data <- readCharacterDataDelimited(base_dir + "data/selfing_data_complete.csv", stateLabels=2, type="NaturalNumbers", delimiter=",", headers=TRUE)
+
+# We need to expand the data to the hidden states
+data_exp <- data.expandCharacters( NUM_HIDDEN )
+
+# Get some useful variables from the data. We need these later on.
+taxa <- observed_phylogeny.taxa()
+
+# set moves and monitor indexes
+mvi = 1
+mni = 1
+
+# moves    = VectorMoves()
+# monitors = VectorMonitors()
+
+### Specify a prior on the initial values of the speciation and extinction rates 
+# We will use a lognormal prior as this distribution can only adopt positive values
+# We centre the rate_mean of the lognormal prior on the observed total number of species
+# Expected num species at time t under constant birth-death is
+# E(N_t) = N_0 e^{rt}
+# Therefore, net diversification r is:
+# r = ( ln N_t - ln N_0 ) / t
+# ln N_t is the total number of species at present
+# ln N_0 is the total number of species at the start of the process (crown node = 2 species)
+# We use r as the mean for the speciation prior
+
+rate_mean <- abs( ln( 3000.0 / 2.0 ) / observed_phylogeny.rootAge() )
+
+# Speciation and extinction rates for each of the 6 states (Observed * Hidden)
+# are drawn from a log normal distribution centered on the mean defined above and with log_sd = 1
+
+# We define multiple movement proposals for each parameter. 
+
+for (i in 1:2) {
+    
+    spec_AB[i] ~ dnLognormal(ln(rate_mean), 1)
+    moves[mvi++] = mvScale(spec_AB[i], lambda=2.0, weight=4)
+    moves[mvi++] = mvScale(spec_AB[i], lambda=0.5, weight=4)
+    moves[mvi++] = mvScale(spec_AB[i], lambda=0.01, weight=4)
+    
+    ext_AB[i] ~ dnLognormal(ln(rate_mean), 1)
+    moves[mvi++] = mvScale(ext_AB[i], lambda=2.0, weight=4)
+    moves[mvi++] = mvScale(ext_AB[i], lambda=0.5, weight=4)
+    moves[mvi++] = mvScale(ext_AB[i], lambda=0.01, weight=4)
+    
+    up_down_scale_mv[i] = mvUpDownScale(lambda=0.5, weight=8)
+    up_down_scale_mv[i].addVariable( spec_AB[i], TRUE )
+    up_down_scale_mv[i].addVariable( ext_AB[i], TRUE )
+    moves[mvi++] = up_down_scale_mv[i]
+    
+    up_down_scale_mv2[i] = mvUpDownScale(lambda=2.0, weight=8)
+    up_down_scale_mv2[i].addVariable( spec_AB[i], TRUE )
+    up_down_scale_mv2[i].addVariable( ext_AB[i], TRUE )
+    moves[mvi++] = up_down_scale_mv2[i]
+
+}
+
+# We assume the rates of the three observed (focal) character traits 0, 1, 2 to be equal.
+# We let the rates of the two hidden character traits A and B to be different.
+# Equivalent to assuming independent rate-variable model (independent from focal character)
+
+# 6 states ordered as: 0A, 1A, 2A, OB, 1B, 2B
+# Therefore: 0A == 1A == 2A; 0B == 1B == 2B
+# But: 0A =! 0B, 1A =! 1B, 2A =! 2B
+
+speciation[1] := spec_AB[1] # 0A
+speciation[2] := spec_AB[1] # 1A
+speciation[3] := spec_AB[1] # 2A
+speciation[4] := spec_AB[2] # 0B
+speciation[5] := spec_AB[2] # 1B
+speciation[6] := spec_AB[2] # 2B
+
+extinction[1] := ext_AB[1] # 0A
+extinction[2] := ext_AB[1] # 1A
+extinction[3] := ext_AB[1] # 2A
+extinction[4] := ext_AB[2] # 0B
+extinction[5] := ext_AB[2] # 1B
+extinction[6] := ext_AB[2] # 2B
+
+diversification := speciation - extinction
+
+# rate_matrix = [0A, 1A, 2A, 0B, 1B, 2B]
+divers_0A := diversification[1]
+divers_1A := diversification[2]
+divers_2A := diversification[3]
+divers_0B := diversification[4]
+divers_1B := diversification[5]
+divers_2B := diversification[6]
+
+# ########################################################
+# Set up the transition rate matrix for observed and hidden states #
+#########################################################
+
+# Each transition rate between observed states are drawn
+# from an exponential distribution with a mean of 10
+# character state transitions over the tree. 
+
+rate_pr := observed_phylogeny.treeLength() / 10
+
+# In Freyman & Hoehna, the number of transitions over the tree varies as a stochast variable "num_events"
+# num_events ~ dnExponential(1/20)
+# moves[mvi++] = mvScale(num_events, lambda=20, weight=3)
+# moves[mvi++] = mvScale(num_events, lambda=2, weight=3)
+# rate_pr := psi.treeLength() / num_events
+
+# But we use a similar model as in MuSSE and HiSSE to make it more comparable
+
+# Model Transitions between observed states
+rate_01 ~ dnExponential( rate_pr ) #transition from phoretic to non-phoretic 
+rate_10 ~ dnExponential( rate_pr ) #transition from non-phoretic to phoretic
+rate_02 ~ dnExponential( rate_pr ) #transition from phoretic to grasshoppers
+rate_20 ~ dnExponential( rate_pr ) #transition from grasshoppers to phoretic
+rate_12 ~ dnExponential( rate_pr ) #transition from non-phoretic to grasshoppers
+rate_21 ~ dnExponential( rate_pr ) #transition from grasshoppers to non-phoretic
+
+Q := [rate_01, rate_02, rate_12, rate_10, rate_20, rate_21]
+
+# In F & H, one of the transitions is forbidden by giving it a rate of 0 (IGNORE)
+# rate_01 <- 0.0 # no secondary gain of incompatibility
+# rate_10 ~ dnExponential( rate_pr )
+# Q := [rate_01, rate_10]
+
+# Model Transitions between hidden states. Unlike in HiSSE, we allowed them to be different.
+rate_AB ~ dnExponential( rate_pr )
+rate_BA ~ dnExponential( rate_pr )
+R := [rate_AB, rate_BA]
+
+# Create the rate matrix for the combined observed and hidden states 
+rate_matrix := fnHiddenStateRateMatrix(Q, R, rescaled=false)
+
+# Add some movements to the stochastic variables
+moves[mvi++] = mvScale(rate_01, lambda=1.0, weight=4)    
+moves[mvi++] = mvScale(rate_10, lambda=1.0, weight=4)
+moves[mvi++] = mvScale(rate_02, lambda=1.0, weight=4)
+moves[mvi++] = mvScale(rate_20, lambda=1.0, weight=4)
+moves[mvi++] = mvScale(rate_12, lambda=1.0, weight=4)
+moves[mvi++] = mvScale(rate_21, lambda=1.0, weight=4)
+moves[mvi++] = mvScale(rate_AB, lambda=1.0, weight=4)
+moves[mvi++] = mvScale(rate_BA, lambda=1.0, weight=4)
+
+moves[mvi++] = mvScale(rate_01, lambda=0.1, weight=4)
+moves[mvi++] = mvScale(rate_10, lambda=0.1, weight=4)
+moves[mvi++] = mvScale(rate_02, lambda=0.1, weight=4)
+moves[mvi++] = mvScale(rate_20, lambda=0.1, weight=4)
+moves[mvi++] = mvScale(rate_12, lambda=0.1, weight=4)
+moves[mvi++] = mvScale(rate_21, lambda=0.1, weight=4)
+moves[mvi++] = mvScale(rate_AB, lambda=0.1, weight=4)
+moves[mvi++] = mvScale(rate_BA, lambda=0.1, weight=4)
+
+
+####################################
+# Set up the root state frequencies #
+##################################### 
+
+# For simplicity we will fix the root frequences to be equal among states
+root_states <- simplex( [1,1,1,1,1,1] ) 
+
+# An alternative is to use a Dirichlet Distribution as in the "HiSSE_2hidden_Aquatic.Rev"
+# root_frequencies ~ dnDirichlet( rep(1,NUM_RATES) )
+
+# If we want to use an irreversible model as in Freyman & Hoehna (IGNORE)
+# root_states <- simplex( [0,1,0,1] ) # Condition on starting in 1A or 1B
+
+
+# rho is the probability of sampling species at the present
+rho <- observed_phylogeny.ntips()/NUM_TOTAL_SPECIES
+
+# character dependent birth death process
+timetree ~ dnCDBDP( rootAge           = observed_phylogeny.rootAge(),
+                    speciationRates   = speciation,
+                    extinctionRates   = extinction, 
+                    Q                 = rate_matrix, 
+                    delta             = 1.0,
+                    pi                = root_states,
+                    rho               = rho,
+                    condition         = "survival")
+                    #taxa              = taxa )
+
+#clamp the model with the observed tree and data
+timetree.clamp( observed_phylogeny )
+timetree.clampCharData( data_exp )
+
+
+#############
+# The Model #
+#############
+
+
+### workspace model wrapper ###
+mymodel = model(timetree)
+
+# monitors
+monitors[mni++] = mnScreen(printgen=10, diversification)
+
+################
+# The Analysis #
+################
+
+### workspace mcmc
+mymcmc = mcmc(mymodel, monitors, moves)
+
+# Add burnin stage
+#mymcmc.burnin(generations=5000, tuningInterval=100)
+
+### run the MCMC
+#mymcmc.run(generations=20000)
+
+
+######### Model Comparisons ############################################################
+# Calculate marginal likelihood using Bayes Factors and path sampling and stepping-stone
+
+pow_p = powerPosterior(mymodel, moves, monitors, "outputPP/MITOS_CID2.out", cats=50)
+
+pow_p.burnin(generations=10000, tuningInterval=100)  # No need if we run this immediately after mymcmc.run
+
+pow_p.run(generations=1000)
+
+ss = steppingStoneSampler(file="outputPPCID2/MITOS_CID2.out", powerColumnName="power", likelihoodColumnName="likelihood")
+ss.marginal()
+
+ps = pathSampler(file="outputPPCID2/MITOS_CID2.out", powerColumnName="power", likelihoodColumnName="likelihood")
+ps.marginal()
+
+# We are not interested in recording any character states or transition events. Only on model comparison
+# Thus, we skip the JointAncestral CharacterState and Stochastic Mapping reconstruction
+
+q()
+
+
+################################################################################
+# APPENDIX S2-6
+# Tree construction
+# Authors: E. Karen López-Estrada & Isabel Sanmartín
+################################################################################
+
+
+library(phylotools)
+library(ape)
+library(TESS)
+library(geiger)
+library(TreePar)
+library(ggtree)
+
+setwd("~/Desktop/SIM_MAY_2020")
+#~/Desktop/SIM_MAY_2020
+
+tree1 <- read.nexus("treeMitosAA.tre")
+tree2 <- extract.clade(tree1, 50)
+write.nexus(tree2, file="treeForLoop.tre")
+
+###sub.taxa.label function from phytools v0.2.2
+sub.taxa.label <- function(tree, dat){
+
+    
+
+    if(!inherits(tree,"phylo")){
+
+       stop("the input tree is not a \"phylo\" object.")
+
+    }
+
+
+
+
+    if(!is.data.frame(dat)){
+
+       stop("the input dat is not a \'data.frame\'.")
+
+    }
+
+
+
+
+    tree2 <- tree
+
+    nnn <- tree$tip.label
+
+
+
+
+    if(!nrow(dat) == length(nnn)){
+
+       warning("Number of tip labels in the phylogenetic\n tree differs from the number of rows in the reference table.\n")
+
+    }
+
+
+
+
+    xxx1 <- as.character(dat[,1])
+
+    xxx2 <- as.character(dat[,2])
+
+
+
+
+    if(!all(xxx1 %in% nnn)){
+
+       unsub.dat <- xxx1[!xxx1 %in% nnn]
+
+       cat("The following names in the reference data.frame \n can not be found in the phylogeny:\n", unsub.dat, "\n")
+
+    }
+
+
+
+
+    if(!all(nnn %in% xxx1)){
+
+        unsub.tree <- nnn[nnn %in% xxx1]
+
+       cat("The following tip labels in the phylogenetic tree \ncan not be found in the reference data.frame:\n", unsub.tree, "\n")
+
+    }
+
+
+
+
+    label <- c()
+
+    for(i in 1:length(dat[,1])){
+
+        for(j in 1:length(nnn)){
+
+            if(nnn[j] == xxx1[i]){
+
+                label[j] <- xxx2[i]
+
+            }
+
+        }
+
+    }
+
+
+
+
+    tree2$tip.label <- label
+
+    return(tree2)
+
+}
+
+
+
+for (i in 1:100) {
+
+	tree1 <- read.nexus("treeForLoop.tre")
+	
+	## N E M O G N A T H I N A E ##
+	
+	nemognathinae <- tess.sim.taxa.age(1, nTaxa=523, age=17.019524, lambda=0.3027873, mu=0.5831564)
+	write.nexus(nemognathinae, file="nemognathinae.tre")
+	nemognathinae1 <- read.nexus("nemognathinae.tre")
+	
+	##let´s change the tip labels
+	nemog_labels <- read.csv("nemognathinae.csv")
+	nemog_tips <- sub.taxa.label(nemognathinae1, nemog_labels)
+	
+	#node 32#
+	
+	last1 <- bind.tree(tree1, nemog_tips, where="32")
+	write.nexus(last1, file="last1.tre")
+	last2 <- read.nexus("last1.tre")
+	##We ned to remove the empirical tips to break the polytomy 
+	last3 <- drop.tip(last2, c(10,15,18,28,29))
+	write.nexus(last3, file="last3.tre")
+	
+	##	E P I C A U T I N I ##
+	
+	epicautini <- tess.sim.taxa.age(1, nTaxa=564, age=16.336117, lambda=0.3233312, mu=0.5831564)
+	write.nexus(epicautini, file="epicautini.tre")
+	epicautini1 <- read.nexus("epicautini.tre")
+	
+	
+	##let´s change the tiplabels
+	epicautini_labels <- read.csv("epicautini.csv")
+	epicautini_tips <- sub.taxa.label(epicautini1, epicautini_labels)
+	
+	#node 1077#
+	
+	last4 <- bind.tree(last3, epicautini_tips, where=1077)
+	write.nexus(last4, file="last4.tre")
+	last5 <- read.nexus("last4.tre")
+	last6 <- drop.tip(last5, c(2,3,4,5,13))
+	write.nexus(last6, file="last6.tre")
+	
+	##	M E L O I N I ##
+	
+	meloini <- tess.sim.taxa.age(1, nTaxa=160, age=18.261133, lambda=0.217648, mu=0.5831564)
+	write.nexus(meloini, file="meloini.tre")
+	meloini1 <- read.nexus("meloini.tre")
+	
+	##let´s change the tiplabels
+	meloini_labels <- read.csv("meloini.csv")
+	meloini_tips <- sub.taxa.label(meloini1, meloini_labels)
+	
+	##svg
+	#node #
+	last7 <- bind.tree(last6, meloini_tips, where=2203)
+	write.nexus(last7, file="last7.tre")
+	last8 <- drop.tip(last7, c(12,13,16))
+	
+	##	E U P O M P H I N I ##
+	
+	eupomphini <- tess.sim.taxa.age(1, nTaxa=26, age=20.644196, lambda=0.1064644, mu=0.5831564)
+	write.nexus(eupomphini, file="eupomphini.tre")
+	eupomphini1 <- read.nexus("eupomphini.tre")
+	
+	##let´s change the tiplabels
+	eupomphini_labels <- read.csv("eupomphini.csv")
+	eupomphini_tips <- sub.taxa.label(eupomphini1, eupomphini_labels)
+	#plot.phylo(eupomphini_tips, cex=0.3)
+	
+	#node 2519#
+	last9 <- bind.tree(last8, eupomphini_tips, where= 2519)
+	
+	write.nexus(last9, file="last9.tre")
+	last10 <- read.nexus("last9.tre")
+	
+	last11 <- drop.tip(last10, c(11,16))
+	
+	## H Y C L E U S ##
+	
+	hycleus <- tess.sim.taxa.age(1, nTaxa=450, age=15.115466, lambda=0.3310096, mu=0.5831564)
+	write.nexus(hycleus, file="hycleus.tre")
+	hycleus1 <- read.nexus("hycleus.tre")
+	
+	##let´s change the tiplabels
+	hycleus_labels <- read.csv("hycleus.csv")
+	hycleus_tips <- sub.taxa.label(hycleus1, hycleus_labels)
+	
+	last12 <- bind.tree(last11, hycleus_tips, where= 2569)
+	
+	write.nexus(last12, file="last12.tre")
+	last13 <- read.nexus("last12.tre")
+	
+	last14 <- drop.tip(last13, c(2,3,9))
+	
+	## M Y L A B R I N I ##
+	
+	mylabrini <- tess.sim.taxa.age(1, nTaxa=285, age=22.077138, lambda=0.2060174, mu=0.5831564)
+	write.nexus(mylabrini, file="mylabrini.tre")
+	mylabrini1 <- read.nexus("mylabrini.tre")
+	
+	##let´s change the tiplabels
+	mylabrini_labels <- read.csv("mylabrini.csv")
+	mylabrini_tips <- sub.taxa.label(mylabrini1, mylabrini_labels)
+	
+	last15 <- bind.tree(last14, mylabrini_tips, where= 3465)
+	
+	write.nexus(last15, file="last15.tre")
+	last16 <- drop.tip(last15, c(2,3,6,8))
+	
+	
+	## L Y T T I N I ##
+	
+	lyttini <- tess.sim.taxa.age(1, nTaxa=137, age=18.91427, lambda=0.2019987, mu=0.5831564)
+	write.nexus(lyttini, file="lyttini2.tre")
+	lyttini1 <- read.nexus("lyttini2.tre")
+	
+	##let´s change the tiplabels
+	lyttini_labels <- read.csv("lyttini.csv")
+	lyttini_tips <- sub.taxa.label(lyttini1, lyttini_labels)
+	
+	w_ly <- bind.tree(last16, lyttini_tips, where= 3110)
+	
+	write.nexus(w_ly, file="w_ly2.tre")
+	w_ly2 <- read.nexus("w_ly2.tre")
+	w_lyDEF <- drop.tip(w_ly2, c(1,5))
+	
+	write.tree(w_lyDEF, paste(i, "SIM.tre", sep=""))
+}
